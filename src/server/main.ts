@@ -12,6 +12,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parseArgs as parseCliArgs } from "node:util";
+import { DatabaseSync } from "node:sqlite";
 import { WebSocket, WebSocketServer } from "ws";
 import Fastify from "fastify";
 import fastifyMultipart from "@fastify/multipart";
@@ -709,8 +710,101 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     throw new Error("multiple main bundles found");
   }
 
+  await pruneArchivedThreadsFromSidebarCatalog();
+
   const module = require(matches[0]!);
   module.runMainAppStartup();
+}
+
+async function pruneArchivedThreadsFromSidebarCatalog(): Promise<void> {
+  // The shell caches a discovery list of threads in <CODEX_HOME>/sqlite/codex.db
+  // (`local_thread_catalog`) and drops entries only when the app-server it is
+  // connected to announces `thread/archived`. Sessions archived through a
+  // different app-server -- `codex archive` from a terminal, for instance --
+  // never produce that notification, so they stay listed in the sidebar's
+  // Recents forever. Cross-reference the catalog against the app-server's own
+  // thread database before the shell opens it, drop rows for threads that are
+  // archived there, and bump the catalog revision so the shell refreshes its
+  // in-memory snapshot.
+  const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
+  const catalogPath = path.join(codexHome, "sqlite", "codex.db");
+
+  let catalog: DatabaseSync;
+  try {
+    catalog = new DatabaseSync(catalogPath);
+  } catch {
+    return;
+  }
+
+  try {
+    const rows = catalog
+      .prepare("select host_id, thread_id from local_thread_catalog")
+      .all() as { host_id: string; thread_id: string }[];
+    if (rows.length === 0) {
+      return;
+    }
+
+    const archived = new Set<string>();
+    const stateNames = (await fs.readdir(codexHome)).filter((name) =>
+      /^state_\d+\.sqlite$/.test(name),
+    );
+    for (const name of stateNames) {
+      let state: DatabaseSync | null = null;
+      try {
+        // Not readOnly: these databases run in WAL mode, which needs write
+        // access to the -shm sidecar even for pure readers.
+        state = new DatabaseSync(path.join(codexHome, name));
+        const hasThreads = state
+          .prepare(
+            "select 1 from sqlite_master where type = 'table' and name = 'threads'",
+          )
+          .get();
+        if (hasThreads) {
+          for (
+            const row of state
+              .prepare("select id from threads where archived = 1")
+              .all() as { id: string }[]
+          ) {
+            archived.add(row.id);
+          }
+        }
+      } catch {
+        // Unreadable state database: keep the catalog rows rather than guess.
+      } finally {
+        state?.close();
+      }
+    }
+
+    const stale = rows.filter((row) => archived.has(row.thread_id));
+    if (stale.length === 0) {
+      return;
+    }
+
+    const remove = catalog.prepare(
+      "delete from local_thread_catalog where host_id = ? and thread_id = ?",
+    );
+    const bumpRevision = catalog.prepare(
+      "update local_thread_catalog_metadata set catalog_revision = catalog_revision + 1",
+    );
+    catalog.exec("begin");
+    try {
+      for (const row of stale) {
+        remove.run(row.host_id, row.thread_id);
+      }
+      bumpRevision.run();
+      catalog.exec("commit");
+    } catch (error) {
+      catalog.exec("rollback");
+      throw error;
+    }
+    console.log(
+      `[codex-web] dropped ${stale.length} archived thread(s) from the sidebar catalog`,
+    );
+  } catch (error) {
+    console.warn("[codex-web] sidebar catalog prune skipped:", error);
+  } finally {
+    catalog.close();
+  }
 }
 
 async function main(args: string[]) {
