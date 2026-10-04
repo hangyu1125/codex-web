@@ -710,22 +710,27 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     throw new Error("multiple main bundles found");
   }
 
-  await pruneArchivedThreadsFromSidebarCatalog();
+  await reconcileSidebarCatalogWithThreadDatabases();
 
   const module = require(matches[0]!);
   module.runMainAppStartup();
 }
 
-async function pruneArchivedThreadsFromSidebarCatalog(): Promise<void> {
-  // The shell caches a discovery list of threads in <CODEX_HOME>/sqlite/codex.db
-  // (`local_thread_catalog`) and drops entries only when the app-server it is
-  // connected to announces `thread/archived`. Sessions archived through a
-  // different app-server -- `codex archive` from a terminal, for instance --
-  // never produce that notification, so they stay listed in the sidebar's
-  // Recents forever. Cross-reference the catalog against the app-server's own
-  // thread database before the shell opens it, drop rows for threads that are
-  // archived there, and bump the catalog revision so the shell refreshes its
-  // in-memory snapshot.
+async function reconcileSidebarCatalogWithThreadDatabases(): Promise<void> {
+  // The shell keeps a discovery cache of threads in
+  // <CODEX_HOME>/sqlite/codex.db (`local_thread_catalog`) and only mutates it
+  // from events of the app-server it is connected to: entries appear when the
+  // shell observes a thread start, and disappear on `thread/archived`.
+  // Threads created by another app-server -- `codex` or `codex exec` from a
+  // terminal -- never show up in the sidebar at all, and sessions archived
+  // that way stay listed under Recents forever. Neither is reconciled, not
+  // even across restarts.
+  //
+  // Before the shell opens the database, reconcile the catalog against the
+  // app-server's own thread databases: drop rows whose thread is archived
+  // there, and insert rows for threads the catalog has never seen. Bump the
+  // catalog revision afterwards so the shell refreshes its in-memory
+  // snapshot.
   const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
   const catalogPath = path.join(codexHome, "sqlite", "codex.db");
 
@@ -737,14 +742,25 @@ async function pruneArchivedThreadsFromSidebarCatalog(): Promise<void> {
   }
 
   try {
-    const rows = catalog
+    const catalogRows = catalog
       .prepare("select host_id, thread_id from local_thread_catalog")
       .all() as { host_id: string; thread_id: string }[];
-    if (rows.length === 0) {
-      return;
-    }
 
-    const archived = new Set<string>();
+    type ThreadRow = {
+      id: string;
+      source: string | null;
+      thread_source: string | null;
+      name: string | null;
+      title: string | null;
+      cwd: string | null;
+      model_provider: string | null;
+      git_branch: string | null;
+      created_at_ms: number | null;
+      updated_at_ms: number | null;
+      recency_at_ms: number | null;
+      archived: number;
+    };
+    const threads: ThreadRow[] = [];
     const stateNames = (await fs.readdir(codexHome)).filter((name) =>
       /^state_\d+\.sqlite$/.test(name),
     );
@@ -760,36 +776,88 @@ async function pruneArchivedThreadsFromSidebarCatalog(): Promise<void> {
           )
           .get();
         if (hasThreads) {
-          for (
-            const row of state
-              .prepare("select id from threads where archived = 1")
-              .all() as { id: string }[]
-          ) {
-            archived.add(row.id);
-          }
+          threads.push(
+            ...(state
+              .prepare(
+                `select id, source, thread_source, name, title, cwd,
+                        model_provider, git_branch, created_at_ms,
+                        updated_at_ms, recency_at_ms, archived
+                   from threads`,
+              )
+              .all() as ThreadRow[]),
+          );
         }
       } catch {
-        // Unreadable state database: keep the catalog rows rather than guess.
+        // Unreadable state database: skip it rather than guess.
       } finally {
         state?.close();
       }
     }
 
-    const stale = rows.filter((row) => archived.has(row.thread_id));
-    if (stale.length === 0) {
+    const sourceKinds = new Set([
+      "cli",
+      "vscode",
+      "exec",
+      "appServer",
+      "chatgpt",
+      "custom",
+      "unknown",
+    ]);
+    const archived = new Set(
+      threads.filter((row) => row.archived === 1).map((row) => row.id),
+    );
+    const known = new Set(catalogRows.map((row) => row.thread_id));
+    const seconds = (ms: number | null): number =>
+      ms == null ? 0 : ms / 1000;
+
+    const stale = catalogRows.filter((row) => archived.has(row.thread_id));
+    const missing = threads.filter(
+      (row) => row.archived === 0 && !known.has(row.id),
+    );
+    if (stale.length === 0 && missing.length === 0) {
       return;
     }
 
     const remove = catalog.prepare(
       "delete from local_thread_catalog where host_id = ? and thread_id = ?",
     );
+    const insert = catalog.prepare(
+      `insert into local_thread_catalog (
+         host_id, thread_id, display_title, source_created_at,
+         source_updated_at, source_recency_at, cwd, source_kind,
+         source_detail, thread_source, model_provider, git_branch,
+         observation_sequence, missing_candidate, pending_observed_title,
+         project_id, conversation_origin
+       ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, null, null)
+       on conflict (host_id, thread_id) do nothing`,
+    );
     const bumpRevision = catalog.prepare(
       "update local_thread_catalog_metadata set catalog_revision = catalog_revision + 1",
     );
+
     catalog.exec("begin");
     try {
       for (const row of stale) {
         remove.run(row.host_id, row.thread_id);
+      }
+      for (const row of missing) {
+        const title =
+          row.name?.trim() || row.title?.trim() || row.id;
+        insert.run(
+          "local",
+          row.id,
+          title,
+          seconds(row.created_at_ms),
+          seconds(row.updated_at_ms),
+          seconds(row.recency_at_ms ?? row.updated_at_ms),
+          row.cwd,
+          row.source != null && sourceKinds.has(row.source) ? row.source : "cli",
+          null,
+          row.thread_source,
+          row.model_provider,
+          row.git_branch,
+          1,
+        );
       }
       bumpRevision.run();
       catalog.exec("commit");
@@ -798,10 +866,10 @@ async function pruneArchivedThreadsFromSidebarCatalog(): Promise<void> {
       throw error;
     }
     console.log(
-      `[codex-web] dropped ${stale.length} archived thread(s) from the sidebar catalog`,
+      `[codex-web] sidebar catalog reconciled: dropped ${stale.length} archived, added ${missing.length} missing thread(s)`,
     );
   } catch (error) {
-    console.warn("[codex-web] sidebar catalog prune skipped:", error);
+    console.warn("[codex-web] sidebar catalog reconcile skipped:", error);
   } finally {
     catalog.close();
   }
