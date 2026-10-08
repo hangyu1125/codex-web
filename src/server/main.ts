@@ -743,8 +743,8 @@ async function reconcileSidebarCatalogWithThreadDatabases(): Promise<void> {
 
   try {
     const catalogRows = catalog
-      .prepare("select host_id, thread_id from local_thread_catalog")
-      .all() as { host_id: string; thread_id: string }[];
+      .prepare("select host_id, thread_id, source_kind from local_thread_catalog")
+      .all() as { host_id: string; thread_id: string; source_kind: string }[];
 
     type ThreadRow = {
       id: string;
@@ -806,11 +806,20 @@ async function reconcileSidebarCatalogWithThreadDatabases(): Promise<void> {
     const archived = new Set(
       threads.filter((row) => row.archived === 1).map((row) => row.id),
     );
+    const allIds = new Set(threads.map((row) => row.id));
     const known = new Set(catalogRows.map((row) => row.thread_id));
     const seconds = (ms: number | null): number =>
       ms == null ? 0 : ms / 1000;
 
-    const stale = catalogRows.filter((row) => archived.has(row.thread_id));
+    // Threads archived elsewhere, and threads that no longer exist at all
+    // (`codex delete` from a terminal), both leave ghost rows behind. Cloud
+    // ("chatgpt") threads live outside the local state databases, so the
+    // existence check must not apply to them.
+    const stale = catalogRows.filter(
+      (row) =>
+        archived.has(row.thread_id) ||
+        (row.source_kind !== "chatgpt" && !allIds.has(row.thread_id)),
+    );
     const missing = threads.filter(
       (row) => row.archived === 0 && !known.has(row.id),
     );
@@ -866,7 +875,7 @@ async function reconcileSidebarCatalogWithThreadDatabases(): Promise<void> {
       throw error;
     }
     console.log(
-      `[codex-web] sidebar catalog reconciled: dropped ${stale.length} archived, added ${missing.length} missing thread(s)`,
+      `[codex-web] sidebar catalog reconciled: dropped ${stale.length} stale, added ${missing.length} missing thread(s)`,
     );
   } catch (error) {
     console.warn("[codex-web] sidebar catalog reconcile skipped:", error);
